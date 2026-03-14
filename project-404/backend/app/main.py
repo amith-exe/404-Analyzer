@@ -5,8 +5,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine
-from app.models.models import Base
 from app.api.routes import router
 
 logging.basicConfig(level=settings.log_level)
@@ -14,8 +12,7 @@ logging.basicConfig(level=settings.log_level)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Tables are managed by Alembic; this is a fallback for local dev
-    Base.metadata.create_all(bind=engine)
+    # Schema is managed by Alembic migrations.
     yield
 
 

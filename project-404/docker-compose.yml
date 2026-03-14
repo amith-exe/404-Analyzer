@@ -13,7 +13,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
 
   redis:
     image: redis:7-alpine
@@ -23,7 +23,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6380}:6379"
 
   api:
     build:
@@ -37,12 +37,14 @@ services:
     volumes:
       - ./backend:/app
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8001}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     build:
@@ -60,18 +62,33 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.tasks.celery_app.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://scanner:scanner@postgres:5432/scanner
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: change-me-in-production-32-chars!!
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   migrate:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: >
-      sh -c "
-        echo 'Waiting for postgres...' &&
-        sleep 5 &&
-        DATABASE_URL=postgresql://scanner:scanner@postgres:5432/scanner
-        alembic upgrade head
-      "
+    command: sh -c "echo 'Waiting for postgres...' && sleep 5 && alembic upgrade head"
     environment:
       DATABASE_URL: postgresql://scanner:scanner@postgres:5432/scanner
     depends_on:
@@ -84,11 +101,12 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      BACKEND_INTERNAL_URL: http://api:8000
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3001}:3000"
     depends_on:
       - api
 
 volumes:
   postgres_data:
+

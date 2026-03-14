@@ -28,6 +28,9 @@ import dns.resolver
 import dns.exception
 
 from app.config import settings
+from app.services.api_discovery import discover_js_endpoints, discover_openapi_endpoints
+from app.services.company_context import generate_company_context
+from app.services.diff_engine import build_scan_diff, post_webhook, should_send_webhook
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -131,6 +134,7 @@ def normalize_target(url: str) -> dict:
 
 def _query_ct_logs(root_domain: str) -> list[str]:
     """Query crt.sh for certificate transparency data."""
+    valid_host = re.compile(r"^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$")
     try:
         with httpx.Client(timeout=15, headers=HTTP_CLIENT_HEADERS) as client:
             resp = client.get(
@@ -143,7 +147,11 @@ def _query_ct_logs(root_domain: str) -> list[str]:
                 for entry in data:
                     name = entry.get("name_value", "")
                     for n in name.split("\n"):
-                        n = n.strip().lstrip("*.")
+                        n = n.strip().lower().lstrip("*.")
+                        if "@" in n or " " in n:
+                            continue
+                        if not valid_host.match(n):
+                            continue
                         if n.endswith(root_domain) and n != root_domain:
                             names.add(n.lower())
                 return list(names)
@@ -155,10 +163,11 @@ def _query_ct_logs(root_domain: str) -> list[str]:
 def _brute_subdomains(root_domain: str) -> list[str]:
     """Attempt DNS resolution for each word in the wordlist."""
     found = []
+    words = SUBDOMAIN_WORDLIST[: max(1, settings.brute_force_wordlist_limit)]
     resolver = dns.resolver.Resolver()
     resolver.timeout = 2
     resolver.lifetime = 4
-    for word in SUBDOMAIN_WORDLIST:
+    for word in words:
         fqdn = f"{word}.{root_domain}"
         try:
             resolver.resolve(fqdn, "A")
@@ -322,6 +331,25 @@ def _extract_links(base_url: str, html: str, root_domain: str) -> list[str]:
     return links
 
 
+def _content_similarity(a: str, b: str) -> float | None:
+    if not a or not b:
+        return None
+    a_tokens = set(re.findall(r"[A-Za-z0-9_]{3,}", a.lower()))
+    b_tokens = set(re.findall(r"[A-Za-z0-9_]{3,}", b.lower()))
+    union = a_tokens | b_tokens
+    if not union:
+        return None
+    return round(len(a_tokens & b_tokens) / len(union), 3)
+
+
+def _via(sources: set[str]) -> str:
+    if "auth" in sources and "unauth" in sources:
+        return "both"
+    if "auth" in sources:
+        return "auth"
+    return "unauth"
+
+
 def crawl(
     start_urls: list[str],
     root_domain: str,
@@ -340,12 +368,17 @@ def crawl(
 
     visited: set[str] = set()
     queue: list[tuple[str, int]] = [(u, 0) for u in start_urls]
-    endpoints: list[dict] = []
+    endpoints_by_url: dict[str, dict] = {}
+    discovered_sources: dict[str, set[str]] = {u: {"unauth"} for u in start_urls}
+    requests_made = 0
 
     with _make_sync_client() as unauth_client, \
          _make_sync_client(extra_headers=auth_headers) as auth_client:
 
         while queue:
+            if requests_made >= settings.max_requests_per_scan:
+                logger.info("crawl request budget exhausted at %s requests", requests_made)
+                break
             url, depth = queue.pop(0)
             if url in visited or depth > max_depth:
                 continue
@@ -361,6 +394,7 @@ def crawl(
                 r = unauth_client.get(
                     url, headers={"User-Agent": settings.user_agent}
                 )
+                requests_made += 1
                 unauth_status = r.status_code
                 unauth_body = r.text[:settings.max_response_size]
                 unauth_headers = dict(r.headers)
@@ -373,24 +407,29 @@ def crawl(
             if auth_headers:
                 try:
                     r2 = auth_client.get(url)
+                    requests_made += 1
                     auth_status = r2.status_code
                     auth_body = r2.text[:settings.max_response_size]
                 except Exception as e:
                     logger.debug("crawl auth GET %s failed: %s", url, e)
 
+            discovered_via = _via(discovered_sources.get(url, {"unauth"}))
             endpoint = {
                 "url": url,
                 "host": urlparse(url).hostname or "",
                 "method": "GET",
                 "source": "crawl",
-                "status_code": unauth_status,
-                "title": _extract_title(unauth_body),
+                "status_code": unauth_status if unauth_status is not None else auth_status,
+                "title": _extract_title(unauth_body or auth_body),
                 "headers": unauth_headers,
                 "unauth_status": unauth_status,
                 "unauth_body": unauth_body[:4096],
                 "auth_status": auth_status,
                 "auth_body": auth_body[:4096] if auth_body else "",
                 "requires_auth": "unknown",
+                "discovered_via": discovered_via,
+                "content_similarity": _content_similarity(unauth_body, auth_body),
+                "auth_only_navigation": discovered_via == "auth",
             }
 
             # Determine requires_auth heuristic
@@ -399,17 +438,31 @@ def crawl(
             elif auth_status and unauth_status == 200:
                 endpoint["requires_auth"] = "no"
 
-            endpoints.append(endpoint)
+            endpoints_by_url[url] = endpoint
 
             # Queue child links
-            if depth < max_depth and unauth_body:
-                for link in _extract_links(url, unauth_body, root_domain):
-                    if link not in visited:
-                        queue.append((link, depth + 1))
+            if depth < max_depth:
+                for source_name, body in (("unauth", unauth_body), ("auth", auth_body)):
+                    if not body:
+                        continue
+                    for link in _extract_links(url, body, root_domain):
+                        sources = discovered_sources.setdefault(link, set())
+                        sources.add(source_name)
+                        if link in endpoints_by_url:
+                            via = _via(sources)
+                            endpoints_by_url[link]["discovered_via"] = via
+                            endpoints_by_url[link]["auth_only_navigation"] = via == "auth"
+                        if link not in visited:
+                            queue.append((link, depth + 1))
+
+            if len(endpoints_by_url) >= settings.max_discovered_endpoints:
+                logger.info("crawl endpoint cap reached at %s", settings.max_discovered_endpoints)
+                break
 
             time.sleep(settings.rate_limit_delay)
 
-    return {"endpoints": endpoints, "visited_count": len(visited)}
+    endpoints = list(endpoints_by_url.values())
+    return {"endpoints": endpoints, "visited_count": len(visited), "requests_made": requests_made}
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +488,11 @@ def run_checks(endpoints: list[dict], probe_results: list[dict],
         url = ep.get("url", "")
         host = ep.get("host", "")
 
-        # Header checks
-        observations.extend(run_header_checks(headers, url))
-
-        # CORS check – test with controlled origin
-        cors_obs = check_cors(headers, url, tested_origin="https://evil.example.com")
-        observations.extend(cors_obs)
+        # Header/CORS checks only for endpoints with observed HTTP response headers.
+        if headers:
+            observations.extend(run_header_checks(headers, url))
+            cors_obs = check_cors(headers, url, tested_origin="https://evil.example.com")
+            observations.extend(cors_obs)
 
         # Auth leakage
         if auth_config:
@@ -452,6 +504,34 @@ def run_checks(endpoints: list[dict], probe_results: list[dict],
                 auth_body=ep.get("auth_body") or "",
             )
             observations.extend(obs)
+
+        # Lightweight authz heuristic for sensitive endpoints
+        if auth_config and ep.get("requires_auth") == "yes":
+            unauth_status = ep.get("unauth_status") or 0
+            auth_status = ep.get("auth_status") or 0
+            similarity = ep.get("content_similarity")
+            if unauth_status == 200 and auth_status == 200 and (similarity is None or similarity > 0.75):
+                observations.append(
+                    {
+                        "check": "possible_broken_access_control",
+                        "title": "Possible broken access control on auth-marked endpoint",
+                        "severity": "high",
+                        "confidence": "low",
+                        "category": "authorization",
+                        "affected_url": url,
+                        "evidence": {
+                            "unauth_status": unauth_status,
+                            "auth_status": auth_status,
+                            "content_similarity": similarity,
+                            "requires_auth": ep.get("requires_auth"),
+                            "source": ep.get("source"),
+                        },
+                        "recommendation": (
+                            "Verify server-side authorization checks and object-level access controls "
+                            "for this endpoint."
+                        ),
+                    }
+                )
 
         # Exposure checks (once per host)
         if host and host not in checked_exposure:
@@ -572,7 +652,8 @@ def run_scan(self, scan_id: int):
     """
     from app.database import SessionLocal
     from app.models import (
-        Asset, AssetType, Artifact, Endpoint, Finding, Scan, ScanStatus
+        Asset, AssetType, Artifact, CompanyContext, Endpoint, Finding, Scan, ScanDiff,
+        ScanStatus, ScheduledScanJob
     )
     from app.utils.crypto import decrypt_secret
 
@@ -610,10 +691,32 @@ def run_scan(self, scan_id: int):
         root_domain = target_info["root_domain"]
         canonical_host = target_info["canonical_host"]
 
+        # Company context generation from canonical URL
+        _update("company_context", 8)
+        context_result = generate_company_context(target_info["final_url"])
+        db_context = CompanyContext(
+            target_id=scan.target_id,
+            scan_id=scan_id,
+            source_url=context_result.source_url,
+            description_raw=context_result.description_raw,
+            industry=context_result.industry,
+            business_model=context_result.business_model,
+            keywords_json=json.dumps(context_result.keywords),
+            likely_attack_surface_json=json.dumps(context_result.likely_attack_surface),
+            where_to_look_first=context_result.where_to_look_first,
+            summary_hash=context_result.summary_hash,
+        )
+        db.add(db_context)
+        db.commit()
+
         # Step 2: enumerate subdomains
         _update("enumerating_subdomains", 10)
         sub_result = enumerate_subdomains(root_domain)
         all_hosts = list(set([canonical_host] + sub_result["all_subdomains"]))
+        if len(all_hosts) > settings.max_hosts_to_probe:
+            # Keep canonical host + deterministic subset to avoid very long probe stalls.
+            trimmed = sorted(h for h in all_hosts if h != canonical_host)
+            all_hosts = [canonical_host] + trimmed[: settings.max_hosts_to_probe - 1]
 
         # Persist assets
         for sub in sub_result["all_subdomains"]:
@@ -628,7 +731,13 @@ def run_scan(self, scan_id: int):
 
         # Step 3: probe hosts
         _update("probing_hosts", 20)
-        probe_results = probe_hosts(all_hosts)
+        probe_results = []
+        total_hosts = max(1, len(all_hosts))
+        for idx, host in enumerate(all_hosts, start=1):
+            probe_results.append(probe_host(host))
+            pct = 20 + int((idx / total_hosts) * 20)
+            _update("probing_hosts", min(39, pct))
+            time.sleep(settings.rate_limit_delay)
         live_hosts = [p for p in probe_results if p["live"]]
 
         for p in probe_results:
@@ -665,6 +774,30 @@ def run_scan(self, scan_id: int):
         )
         crawl_endpoints = crawl_result["endpoints"]
 
+        # API-first discovery (OpenAPI + JS routes)
+        _update("api_discovery", 50)
+        openapi_endpoints = discover_openapi_endpoints(
+            start_urls=start_urls,
+            root_domain=root_domain,
+            auth_config=auth_config,
+        )
+        js_endpoints = discover_js_endpoints(crawl_endpoints, root_domain=root_domain)
+
+        merged: dict[tuple[str, str], dict] = {}
+        for ep in crawl_endpoints + openapi_endpoints + js_endpoints:
+            key = (ep.get("method", "GET"), ep["url"])
+            existing = merged.get(key)
+            if not existing:
+                merged[key] = ep
+                continue
+            # Prefer endpoints with status/title/headers data
+            if existing.get("status_code") is None and ep.get("status_code") is not None:
+                merged[key] = ep
+            else:
+                if existing.get("source") != "crawl" and ep.get("source") == "crawl":
+                    merged[key] = ep
+        crawl_endpoints = list(merged.values())
+
         # Persist endpoints
         for ep in crawl_endpoints:
             # Redact auth info from stored headers
@@ -678,8 +811,13 @@ def run_scan(self, scan_id: int):
                 url=ep["url"],
                 method=ep["method"],
                 source=ep["source"],
+                discovered_via=ep.get("discovered_via", "unauth"),
                 requires_auth=ep.get("requires_auth", "unknown"),
                 status_code=ep.get("status_code"),
+                unauth_status_code=ep.get("unauth_status"),
+                auth_status_code=ep.get("auth_status"),
+                content_similarity=ep.get("content_similarity"),
+                auth_only_navigation=bool(ep.get("auth_only_navigation")),
                 title=ep.get("title"),
                 headers_json=json.dumps(safe_headers),
             )
@@ -740,6 +878,44 @@ def run_scan(self, scan_id: int):
         )
         db.add(artifact)
 
+        # Diff latest scan vs previous completed scan for target
+        _update("diffing", 95)
+        previous_scan = (
+            db.query(Scan)
+            .filter(
+                Scan.target_id == scan.target_id,
+                Scan.status == ScanStatus.completed,
+                Scan.id != scan_id,
+            )
+            .order_by(Scan.finished_at.desc())
+            .first()
+        )
+        if previous_scan:
+            summary = build_scan_diff(previous_scan=previous_scan, current_scan=scan, db=db)
+            diff_row = ScanDiff(
+                target_id=scan.target_id,
+                scan_id=scan_id,
+                previous_scan_id=previous_scan.id,
+                summary_json=json.dumps(summary),
+                webhook_sent=False,
+            )
+            db.add(diff_row)
+            db.flush()
+
+            schedule_job_id = config.get("schedule_job_id")
+            if schedule_job_id:
+                job = db.query(ScheduledScanJob).filter(ScheduledScanJob.id == schedule_job_id).first()
+                if job and job.alert_webhook_url and should_send_webhook(summary, job.diff_threshold):
+                    payload = {
+                        "event": "scan_diff_alert",
+                        "target_id": scan.target_id,
+                        "scan_id": scan_id,
+                        "previous_scan_id": previous_scan.id,
+                        "counts": summary.get("counts", {}),
+                        "summary": summary,
+                    }
+                    diff_row.webhook_sent = post_webhook(job.alert_webhook_url, payload)
+
         scan.status = ScanStatus.completed
         scan.finished_at = datetime.now(timezone.utc)
         scan.progress = 100
@@ -748,6 +924,7 @@ def run_scan(self, scan_id: int):
 
     except Exception as e:
         logger.exception("Scan %s failed: %s", scan_id, e)
+        db.rollback()
         scan = db.query(Scan).filter(Scan.id == scan_id).first()
         if scan:
             scan.status = ScanStatus.failed
@@ -756,3 +933,4 @@ def run_scan(self, scan_id: int):
             db.commit()
     finally:
         db.close()
+

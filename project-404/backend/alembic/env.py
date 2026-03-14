@@ -7,7 +7,11 @@ from alembic import context
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # This repo uses a minimal alembic.ini without logging sections.
+    # Guard fileConfig so migrations work in Docker/local.
+    ini_section = config.get_section("formatters")
+    if ini_section:
+        fileConfig(config.config_file_name)
 
 # Import models so Alembic can see them
 from app.database import Base

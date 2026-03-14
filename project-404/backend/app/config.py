@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     crawl_timeout: float = 10.0
     crawl_max_depth: int = 2
     crawl_concurrency: int = 5
+    max_requests_per_scan: int = 400
+    max_discovered_endpoints: int = 2000
+    brute_force_wordlist_limit: int = 80
+    max_hosts_to_probe: int = 50
     probe_timeout: float = 10.0
     rate_limit_delay: float = 0.3
     log_level: str = "INFO"
